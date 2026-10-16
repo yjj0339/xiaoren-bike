@@ -37,6 +37,21 @@ await check('http://127.0.0.1:8123/', { width: 1280, height: 800 }, 'desktop', a
 });
 await check('http://127.0.0.1:8123/', { width: 390, height: 844 }, 'mobile');
 await check('http://127.0.0.1:8123/', { width: 1920, height: 900 }, 'wide');
+{
+  const page = await b.newPage({ viewport: { width: 1280, height: 800 } });
+  const errs = [];
+  page.on('pageerror', e => errs.push(String(e)));
+  await page.goto('http://127.0.0.1:8123/', { waitUntil: 'load' });
+  await page.waitForTimeout(600);
+  await page.evaluate(() => window.__setDist(22500));
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: 'shots/desktop-warm.png' });
+  await page.evaluate(() => window.__jump());
+  await page.waitForTimeout(260);
+  await page.screenshot({ path: 'shots/desktop-jump.png' });
+  errors.push(...errs);
+  await page.close();
+}
 
 console.log(JSON.stringify({ results, totalErrors: errors.length, errors: errors.slice(0, 5) }, null, 2));
 await b.close();
