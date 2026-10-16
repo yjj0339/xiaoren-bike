@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#bfe7ff">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚲</text></svg>">
+<title>小人骑车 · 清晨骑行</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#cfeaff;
+  font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;animation:fadein .6s ease}
+@keyframes fadein{from{opacity:0}}
+#stage{position:fixed;inset:0;width:100%;height:100%;display:block;
+  touch-action:none;user-select:none;-webkit-user-select:none;cursor:pointer}
+.chip{position:fixed;background:rgba(255,255,255,.85);backdrop-filter:blur(6px);
+  border-radius:999px;padding:8px 16px;color:#2b6cb0;font-size:14px;font-weight:600;
+  box-shadow:0 2px 10px rgba(30,80,140,.12);pointer-events:none;z-index:5}
+#title{left:14px;top:14px}
+#hud{right:14px;top:14px;color:#4a5568;font-variant-numeric:tabular-nums;font-weight:600}
+#hint{left:50%;transform:translateX(-50%);bottom:calc(14px + env(safe-area-inset-bottom));
+  font-weight:500;color:#5b6b7c;font-size:13px;white-space:nowrap;transition:opacity 1s}
+#bell{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));width:52px;height:52px;
+  border-radius:50%;border:none;background:#fff;box-shadow:0 4px 14px rgba(30,80,140,.18);
+  font-size:24px;cursor:pointer;z-index:6;transition:transform .08s}
+#bell:active{transform:scale(.88)}
+@media (max-width:560px){
+  #hint{left:14px;transform:none;bottom:calc(16px + env(safe-area-inset-bottom));font-size:12px;
+    max-width:52vw;white-space:normal;line-height:1.5;padding:6px 12px}
+  #title{font-size:13px;padding:7px 12px}
+  #hud{font-size:12px;padding:7px 12px}
+}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="chip" id="title">🚲 小人骑车</div>
+<div class="chip" id="hud"><span id="hudSpeed">0</span> km/h · <span id="hudDist">0.00</span> km</div>
+<div class="chip" id="hint">点画面 / 空格：铃铃～ · 按住：加速冲刺</div>
+<button id="bell" aria-label="按车铃">🔔</button>
+<script>
+"use strict";
+const TAU=Math.PI*2;
+const cvs=document.getElementById("stage"),ctx=cvs.getContext("2d");
+let W=0,H=0,DPR=1,skyGrad=null;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=window.innerWidth;H=window.innerHeight;
+  cvs.width=Math.round(W*DPR);cvs.height=Math.round(H*DPR);
+  skyGrad=ctx.createLinearGradient(0,0,0,H);
+  skyGrad.addColorStop(0,"#aadcff");skyGrad.addColorStop(.65,"#d8f0ff");skyGrad.addColorStop(1,"#eef9ff");
+}
+window.addEventListener("resize",resize);resize();
+
+/* ---------- 常量 ---------- */
+const R=42;                       // 车轮半径（本地坐标）
+const CRUISE=250,SPRINT=545;      // 世界滚动速度 px/s
+const GEO={
+  front:{x:152,y:0},
+  crank:{x:70,y:-6},ringR:15,armR:26,
+  seatC:{x:34,y:-92},headT:{x:136,y:-86},
+  grip:{x:143,y:-95},
+  hip:{x:28,y:-106}
+};
+const SKIN="#ffd9b0",SKIN_D="#eab98c";
+const SHIRT="#ffb43a",SHIRT_D="#e09a1f";
+const PANTS="#3d5a80",PANTS_D="#2f4666";
+const HELMET="#38ada9",SCARF="#e94f6b";
+const FRAME_C="#ff7757";
+
+/* ---------- 状态 ---------- */
+const S={dist:0,speed:CRUISE,target:CRUISE,crank:0,wheel:0,t:0,bob:0,lean:0};
+let L=null,bubbles=[],dust=[],lastBell=0;
+let ptrDown=false,ptrTime=0,keySprint=false,ptrSprint=false;
+const errLog=[];
+window.addEventListener("error",e=>errLog.push(String(e.message||e)));
+
+function layout(){
+  const s=Math.min(Math.max(Math.min(W/700,H/520),W<640?0.78:0.6),1.45);
+  const groundY=Math.min(H*0.80,H-108);
+  const rx=W*(W<640?0.40:0.36);
+  return {s,groundY,rx,ry:groundY-R*s,horizon:H*0.648};
+}
+function rnd(i,s){const x=Math.sin(i*127.1+s*311.7)*43758.5453;return x-Math.floor(x);}
+
+/* ---------- 绘图小工具 ---------- */
+function line(x1,y1,x2,y2,w,c){ctx.strokeStyle=c;ctx.lineWidth=w;
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();}
+function circle(x,y,r,c){ctx.fillStyle=c;ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();}
+function capsule(x1,y1,x2,y2,w,c){line(x1,y1,x2,y2,w,c);}
+
+/* 两骨 IK：返回膝关节与（可能被夹紧的）末端 */
+function ik(ax,ay,bx,by,l1,l2,pickUp){
+  let dx=bx-ax,dy=by-ay,d=Math.hypot(dx,dy)||0.001;
+  const m=l1+l2-0.5;
+  if(d>m){bx=ax+dx/d*m;by=ay+dy/d*m;dx=bx-ax;dy=by-ay;d=m;}
+  const a=(l1*l1-l2*l2+d*d)/(2*d);
+  const h=Math.sqrt(Math.max(l1*l1-a*a,0));
+  const ux=dx/d,uy=dy/d,mx=ax+ux*a,my=ay+uy*a;
+  const k1={x:mx-uy*h,y:my+ux*h},k2={x:mx+uy*h,y:my-ux*h};
+  const k=pickUp?(k1.y<k2.y?k1:k2):(k1.y>k2.y?k1:k2);
+  return {kx:k.x,ky:k.y,bx,by};
+}
+
+/* ---------- 声音 ---------- */
+let AC=null;
+function ding(){
+  try{
+    AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==="suspended")AC.resume();
+    const t=AC.currentTime;
+    [[1318.5,0],[1760,0.07]].forEach(([f,d])=>{
+      const o=AC.createOscillator(),g=AC.createGain();
+      o.type="sine";o.frequency.value=f;
+      g.gain.setValueAtTime(0.0001,t+d);
+      g.gain.exponentialRampToValueAtTime(0.22,t+d+0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001,t+d+0.5);
+      o.connect(g);g.connect(AC.destination);
+      o.start(t+d);o.stop(t+d+0.55);
+    });
+  }catch(e){}
+}
+function bell(){
+  const now=performance.now();
+  if(now-lastBell<280)return;
+  lastBell=now;ding();
+  bubbles.push({t:0,x:L.bx,y:L.by});
+}
+
+/* ---------- 输入 ---------- */
+cvs.addEventListener("pointerdown",e=>{ptrDown=true;ptrTime=performance.now();ptrSprint=false;});
+cvs.addEventListener("pointerup",()=>{if(performance.now()-ptrTime<230)bell();ptrDown=false;ptrSprint=false;});
+cvs.addEventListener("pointercancel",()=>{ptrDown=false;ptrSprint=false;});
+window.addEventListener("keydown",e=>{
+  if(e.code==="Space"&&!e.repeat){e.preventDefault();bell();}
+  if(e.code==="ArrowRight"||e.code==="ArrowUp"){keySprint=true;S.target=SPRINT;}
+});
+window.addEventListener("keyup",e=>{
+  if(e.code==="ArrowRight"||e.code==="ArrowUp"){keySprint=false;S.target=CRUISE;}
+});
+document.getElementById("bell").addEventListener("click",bell);
+setTimeout(()=>{document.getElementById("hint").style.opacity=0;},9000);
+
+/* ---------- 更新 ---------- */
+function update(dt){
+  S.t+=dt;
+  if(ptrDown&&performance.now()-ptrTime>230)ptrSprint=true;
+  const sprinting=keySprint||ptrSprint;
+  S.target=sprinting?SPRINT:CRUISE;
+  S.speed+=(S.target-S.speed)*Math.min(1,dt*2.2);
+  S.dist+=S.speed*dt;
+  S.wheel+=S.speed*dt/R;
+  S.crank+=S.speed*dt/R*0.5;
+  S.lean+=( (sprinting?1:0)-S.lean)*Math.min(1,dt*4);
+  S.bob=Math.sin(S.crank*2)*1.6*(1-S.lean*0.5);
+  if(S.lean>0.5&&Math.random()<dt*26){
+    dust.push({x:L.rx-R*L.s*0.8,y:L.groundY-5,vx:-(60+Math.random()*100),vy:-(15+Math.random()*55),
+      r:2.5+Math.random()*3,a:0.55});
+  }
+  for(const p of dust){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=40*dt;p.r+=dt*7;p.a-=dt*1.5;}
+  dust=dust.filter(p=>p.a>0);
+  for(const b of bubbles)b.t+=dt;
+  bubbles=bubbles.filter(b=>b.t<1);
+}
+
+/* ---------- 背景 ---------- */
+function ridge(yBase,amp,color,k1,k2,phase,speed){
+  ctx.fillStyle=color;ctx.beginPath();ctx.moveTo(0,H);
+  const off=S.dist*speed;
+  for(let x=0;x<=W+8;x+=8){
+    const wx=x+off;
+    const y=yBase-amp*(0.6*Math.sin(wx*k1+phase)+0.4*Math.sin(wx*k2+phase*2.7))-amp*0.25;
+    ctx.lineTo(x,y);
+  }
+  ctx.lineTo(W,H);ctx.closePath();ctx.fill();
+}
+function drawCloud(x,y,s){
+  ctx.fillStyle="rgba(255,255,255,.92)";
+  ctx.beginPath();
+  ctx.arc(x,y,20*s,0,TAU);ctx.arc(x+22*s,y-9*s,15*s,0,TAU);
+  ctx.arc(x+44*s,y-1*s,17*s,0,TAU);ctx.arc(x+21*s,y+7*s,18*s,0,TAU);
+  ctx.fill();
+}
+function clouds(){
+  for(let i=0;i<6;i++){
+    const m=W+520;
+    let x=(i*430+rnd(i,9)*260-S.dist*0.07-S.t*7)%m;
+    if(x<0)x+=m;
+    x-=260;
+    const y=H*(0.07+rnd(i,3)*0.20);
+    drawCloud(x,y,0.7+rnd(i,5)*0.65);
+  }
+}
+function sun(){
+  const sx=W*0.84,sy=H*0.14;
+  const g=ctx.createRadialGradient(sx,sy,20,sx,sy,110);
+  g.addColorStop(0,"rgba(255,220,130,.55)");g.addColorStop(1,"rgba(255,220,130,0)");
+  ctx.fillStyle=g;ctx.beginPath();ctx.arc(sx,sy,110,0,TAU);ctx.fill();
+  circle(sx,sy,30,"#ffd968");circle(sx-4,sy-4,22,"#ffe28a");
+}
+function birds(){
+  ctx.strokeStyle="#7f95ad";ctx.lineWidth=2.4;
+  for(let i=0;i<3;i++){
+    const m=W+320;
+    let x=W+160-((S.dist*0.22+i*340+S.t*30)%m);
+    const y=H*(0.09+i*0.045)+Math.sin(S.t*1.3+i*2)*10;
+    const wing=Math.sin(S.t*9+i*1.7)*4.5;
+    ctx.beginPath();
+    ctx.moveTo(x-8,y+wing);ctx.lineTo(x,y);ctx.lineTo(x+8,y+wing);
+    ctx.stroke();
+  }
+}
+function treeRound(x,y,k){
+  line(x,y,x,y-46*k,7*k,"#8a6a4a");
+  circle(x-13*k,y-52*k,17*k,"#5fb760");
+  circle(x+13*k,y-50*k,16*k,"#5fb760");
+  circle(x,y-66*k,20*k,"#6fc76f");
+  circle(x-6*k,y-70*k,9*k,"#8fd98a");
+}
+function pine(x,y,k){
+  line(x,y,x,y-24*k,6*k,"#8a6a4a");
+  ctx.fillStyle="#4da168";
+  for(let j=0;j<3;j++){
+    const w=(40-j*9)*k,top=y-(34+j*26)*k,bot=y-(8+j*24)*k;
+    ctx.beginPath();ctx.moveTo(x-w/2,bot);ctx.lineTo(x,top);ctx.lineTo(x+w/2,bot);ctx.closePath();ctx.fill();
+  }
+}
+function bushC(x,y,k){
+  circle(x-10*k,y-8*k,12*k,"#5aa95c");circle(x+9*k,y-7*k,11*k,"#6fb76f");circle(x,y-14*k,10*k,"#7cc47b");
+}
+function house(x,y,k){
+  const w=64*k,h=44*k;
+  ctx.fillStyle="#fff3dd";ctx.fillRect(x-w/2,y-h,w,h);
+  ctx.fillStyle="#ff9d76";
+  ctx.beginPath();ctx.moveTo(x-w/2-6*k,y-h);ctx.lineTo(x,y-h-30*k);ctx.lineTo(x+w/2+6*k,y-h);ctx.closePath();ctx.fill();
+  ctx.fillStyle="#b97a56";ctx.fillRect(x-7*k,y-22*k,14*k,22*k);
+  ctx.fillStyle="#bfe3ff";ctx.fillRect(x+w*0.14,y-h+10*k,13*k,11*k);
+  ctx.strokeStyle="#fff";ctx.lineWidth=1.5*k;ctx.strokeRect(x+w*0.14,y-h+10*k,13*k,11*k);
+}
+function midLayer(){
+  const sp=190,speed=0.5,base=L.horizon+H*0.075,sc=L.s*0.95;
+  const off=S.dist*speed;
+  const i0=Math.floor((off-140)/sp),i1=Math.ceil((off+W+140)/sp);
+  for(let i=i0;i<=i1;i++){
+    const r=rnd(i,1),x=i*sp+rnd(i,2)*70-off,k=(0.75+rnd(i,4)*0.55)*sc;
+    if(r<0.42)treeRound(x,base,k);
+    else if(r<0.66)pine(x,base,k);
+    else if(r<0.86)bushC(x,base,k);
+    else house(x,base,k);
+  }
+}
+function flowersMid(){
+  const sp=300,speed=0.8,off=S.dist*speed;
+  const i0=Math.floor((off-40)/sp),i1=Math.ceil((off+W+40)/sp);
+  const cols=["#ff8fa3","#ffd166","#c39bd3"];
+  const maxY=L.groundY-16;
+  for(let i=i0;i<=i1;i++){
+    if(rnd(i,12)<0.3)continue;
+    const x=i*sp+rnd(i,6)*90-off;
+    const y=Math.min(L.horizon+H*(0.07+rnd(i,7)*0.05),maxY);
+    line(x,y+8,x,y,2,"#7fb069");
+    circle(x,y,3,cols[Math.floor(rnd(i,5)*cols.length)%3]);
+  }
+}
+function road(){
+  const gy=L.groundY;
+  line(0,gy-3,W,gy-3,6,"#9fd489");
+  const g=ctx.createLinearGradient(0,gy,0,H);
+  g.addColorStop(0,"#efeade");g.addColorStop(1,"#e2dccc");
+  ctx.fillStyle=g;ctx.fillRect(0,gy,W,H-gy);
+  line(0,gy+2,W,gy+2,3,"#ffffff");
+  ctx.save();
+  ctx.strokeStyle="#f2c14e";ctx.lineWidth=5;
+  ctx.setLineDash([46,34]);ctx.lineDashOffset=S.dist%80;
+  const y=gy+(H-gy)*0.42;
+  ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+  ctx.restore();
+}
+function foreground(){
+  const sp=460,speed=1.28,off=S.dist*speed;
+  const i0=Math.floor((off-120)/sp),i1=Math.ceil((off+W+120)/sp);
+  for(let i=i0;i<=i1;i++){
+    if(rnd(i,8)<0.45)continue;
+    const x=i*sp+rnd(i,10)*160-off;
+    const k=(0.9+rnd(i,11)*0.5)*L.s;
+    const topY=H-46*k;
+    circle(x-16*k,H-8,10*k,"#8cc63f");
+    circle(x+14*k,H-10,9*k,"#8cc63f");
+    line(x,H,x,topY,4.5*k,"#7fb069");
+    circle(x,topY,12*k,"#ff8fa3");
+    circle(x,topY,5*k,"#ffd166");
+  }
+}
+
+/* ---------- 车 + 人 ---------- */
+function wheel(cx,cy,ang){
+  ctx.strokeStyle="#394048";ctx.lineWidth=10;
+  ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.stroke();
+  ctx.strokeStyle="#eef1f5";ctx.lineWidth=4;
+  ctx.beginPath();ctx.arc(cx,cy,R-8,0,TAU);ctx.stroke();
+  ctx.strokeStyle="#c3cad3";ctx.lineWidth=1.6;
+  for(let i=0;i<10;i++){
+    const a=ang+i*Math.PI/5;
+    ctx.beginPath();ctx.moveTo(cx,cy);
+    ctx.lineTo(cx+Math.cos(a)*(R-10),cy+Math.sin(a)*(R-10));
+    ctx.stroke();
+  }
+  circle(cx,cy,5.5,"#8b939e");
+}
+function crankArm(p,c){line(GEO.crank.x,GEO.crank.y,p.x,p.y,5.5,c);}
+function pedal(p){
+  ctx.fillStyle="#2f333b";ctx.beginPath();
+  if(ctx.roundRect)ctx.roundRect(p.x-10,p.y-3,20,6,3);
+  else ctx.rect(p.x-10,p.y-3,20,6);
+  ctx.fill();
+}
+function shoe(p,c,sole){
+  ctx.fillStyle=c;ctx.beginPath();
+  ctx.ellipse(p.x+3,p.y-4.5,9.5,4.8,-0.06,0,TAU);ctx.fill();
+  line(p.x-6,p.y-1,p.x+11,p.y-1,3,sole);
+}
+function legDraw(hx,hy,r,pantsC,skinC){
+  line(hx,hy,r.kx,r.ky,11.5,pantsC);
+  line(r.kx,r.ky,r.bx,r.by,9,skinC);
+}
+function armDraw(hx,hy,r,skinC,sleeveC){
+  line(hx,hy,r.kx,r.ky,8.5,skinC);
+  line(r.kx,r.ky,r.bx,r.by,8,skinC);
+  if(sleeveC){
+    const t=0.66,sx=hx+(r.kx-hx)*t,sy=hy+(r.ky-hy)*t;
+    line(hx,hy,sx,sy,13,sleeveC);
+  }
+}
+function bike(){
+  const C=GEO.crank;
+  wheel(0,0,S.wheel);wheel(GEO.front.x,GEO.front.y,S.wheel);
+  line(0,0,C.x,C.y,7,FRAME_C);
+  line(0,0,GEO.seatC.x,GEO.seatC.y,6.5,FRAME_C);
+  line(C.x,C.y,GEO.seatC.x,GEO.seatC.y,8,FRAME_C);
+  line(C.x,C.y,GEO.headT.x,GEO.headT.y,8.5,FRAME_C);
+  line(GEO.seatC.x,GEO.seatC.y,GEO.headT.x,GEO.headT.y,7,FRAME_C);
+  line(GEO.headT.x,GEO.headT.y,GEO.front.x,GEO.front.y,7,FRAME_C);
+  /* 车把 + 车铃 */
+  line(GEO.headT.x,GEO.headT.y,GEO.grip.x-3,GEO.grip.y-1,6,"#454b54");
+  circle(GEO.grip.x,GEO.grip.y,4.2,"#2f333b");
+  circle(GEO.headT.x+5,GEO.headT.y-4,4.6,"#f6c445");
+  ctx.strokeStyle="#d9a520";ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.arc(GEO.headT.x+5,GEO.headT.y-4,4.6,0,TAU);ctx.stroke();
+  /* 座管 + 车座 */
+  line(GEO.seatC.x,GEO.seatC.y,30,-99,5,"#454b54");
+  capsule(16,-102,46,-100,9,"#2f333b");
+  /* 飞轮 + 牙盘 + 链条 */
+  ctx.strokeStyle="#7a828c";ctx.lineWidth=3.5;
+  ctx.beginPath();ctx.arc(0,0,8.5,0,TAU);ctx.stroke();
+  ctx.lineWidth=4.5;
+  ctx.beginPath();ctx.arc(C.x,C.y,GEO.ringR,0,TAU);ctx.stroke();
+  circle(C.x,C.y,5,"#5a616b");
+  ctx.save();ctx.setLineDash([5,4]);
+  line(C.x,C.y-GEO.ringR,1,-7.5,3,"#5f6670");
+  line(C.x,C.y+GEO.ringR,1,7.5,3,"#5f6670");
+  ctx.restore();
+}
+function scarf(Sh,Hd,lean){
+  const ax=Sh.x+(Hd.x-Sh.x)*0.12-2,ay=Sh.y+(Hd.y-Sh.y)*0.12+4;
+  const pts=[{x:ax,y:ay}];
+  let px=ax,py=ay;
+  const start=Math.PI+0.5,end=Math.PI-0.08-lean*0.3;
+  for(let i=1;i<=7;i++){
+    const base=start+(end-start)*Math.min(1,i/2.5);
+    const flut=Math.sin(S.t*9-i*0.85)*(0.10+0.045*i)*(0.75+lean*0.7);
+    const a=base-i*0.03+flut;
+    px+=Math.cos(a)*11;py+=Math.sin(a)*11;
+    pts.push({x:px,y:py});
+  }
+  const n=pts.length,Ls=[],Rs=[];
+  for(let i=0;i<n;i++){
+    const p0=pts[Math.max(0,i-1)],p1=pts[Math.min(n-1,i+1)];
+    let dx=p1.x-p0.x,dy=p1.y-p0.y;
+    const dl=Math.hypot(dx,dy)||1;dx/=dl;dy/=dl;
+    const w=6.5*(1-i/(n-1))+1.2;
+    Ls.push({x:pts[i].x-dy*w,y:pts[i].y+dx*w});
+    Rs.push({x:pts[i].x+dy*w,y:pts[i].y-dx*w});
+  }
+  ctx.fillStyle=SCARF;ctx.beginPath();
+  ctx.moveTo(Ls[0].x,Ls[0].y);
+  for(let i=1;i<n;i++)ctx.lineTo(Ls[i].x,Ls[i].y);
+  for(let i=n-1;i>=0;i--)ctx.lineTo(Rs[i].x,Rs[i].y);
+  ctx.closePath();ctx.fill();
+  circle(ax,ay,5,SCARF);
+}
+function headDraw(Hd,Sh,ha){
+  line(Sh.x,Sh.y-2,Hd.x-Math.cos(ha)*9,Hd.y+Math.sin(ha)*9,7,SKIN);
+  circle(Hd.x,Hd.y,14.5,SKIN);
+  circle(Hd.x-5,Hd.y+1.5,3.4,SKIN_D);
+  circle(Hd.x+7.5,Hd.y-1.5,2.3,"#2f3540");
+  ctx.strokeStyle="#2f3540";ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(Hd.x+4.5,Hd.y+3.2,4.6,Math.PI*0.18,Math.PI*0.72);ctx.stroke();
+  ctx.globalAlpha=.5;circle(Hd.x+9.5,Hd.y+4.5,2.6,"#ff9d9d");ctx.globalAlpha=1;
+  /* 头盔 */
+  ctx.strokeStyle=HELMET;ctx.lineWidth=8.5;
+  ctx.beginPath();ctx.arc(Hd.x,Hd.y-0.5,15.5,Math.PI*1.02,Math.PI*2.02);ctx.stroke();
+  line(Hd.x+13.5,Hd.y-8.5,Hd.x+19.5,Hd.y-6.5,6,HELMET);
+  ctx.strokeStyle="#d64545";ctx.lineWidth=2.2;
+  [Math.PI*1.62,Math.PI*1.82].forEach(a=>{
+    ctx.beginPath();
+    ctx.moveTo(Hd.x+Math.cos(a)*12,Hd.y-0.5+Math.sin(a)*12);
+    ctx.lineTo(Hd.x+Math.cos(a)*16,Hd.y-0.5+Math.sin(a)*16);
+    ctx.stroke();
+  });
+  circle(Hd.x-13.5,Hd.y-1,4,"#6b4f3a");
+  circle(Hd.x-11.5,Hd.y+3.5,3,"#6b4f3a");
+}
+function riderAll(){
+  ctx.save();
+  ctx.translate(L.rx,L.ry);ctx.scale(L.s,L.s);
+  const C=GEO.crank,th=S.crank,lean=S.lean;
+  const p1={x:C.x+Math.cos(th)*GEO.armR,y:C.y+Math.sin(th)*GEO.armR};
+  const p2={x:C.x-Math.cos(th)*GEO.armR,y:C.y-Math.sin(th)*GEO.armR};
+  const hip={x:GEO.hip.x+lean*7,y:GEO.hip.y+S.bob};
+  const ta=(46-9*lean)*Math.PI/180;
+  const Sh={x:hip.x+Math.cos(ta)*54,y:hip.y-Math.sin(ta)*54};
+  const ha=ta+10*Math.PI/180;
+  const Hd={x:Sh.x+Math.cos(ha)*27,y:Sh.y-Math.sin(ha)*27};
+  const G=GEO.grip;
+  /* 远侧手臂 */
+  const armF=ik(Sh.x+1,Sh.y-1,G.x-1,G.y-1,47,45,false);
+  armDraw(Sh.x+1,Sh.y-1,armF,SKIN_D,SHIRT_D);
+  circle(G.x-1,G.y-1,5.2,SKIN_D);
+  /* 远侧曲柄 + 踏板 + 远侧腿 */
+  crankArm(p2,"#262b31");pedal(p2);
+  const legF=ik(hip.x+2,hip.y+3,p2.x,p2.y-6,72,68,true);
+  legDraw(hip.x+2,hip.y+3,legF,PANTS_D,SKIN_D);
+  shoe(p2,"#e6e9ef","#b9c0ca");
+  /* 车架 */
+  bike();
+  /* 近侧曲柄 + 踏板 */
+  crankArm(p1,"#3c424a");pedal(p1);
+  /* 近侧腿 */
+  const legN=ik(hip.x,hip.y,p1.x,p1.y-6,72,68,true);
+  legDraw(hip.x,hip.y,legN,PANTS,SKIN);
+  shoe(p1,"#ffffff","#cfd4da");
+  /* 短裤 + 上衣 */
+  capsule(hip.x-5,hip.y+2,hip.x+9,hip.y-1,19,PANTS);
+  capsule(hip.x,hip.y,Sh.x,Sh.y,17,SHIRT);
+  /* 围巾 + 头 */
+  scarf(Sh,Hd,lean);
+  headDraw(Hd,Sh,ha);
+  /* 近侧手臂 */
+  const armN=ik(Sh.x,Sh.y,G.x-1,G.y-2,49,46,false);
+  armDraw(Sh.x,Sh.y,armN,SKIN,SHIRT);
+  circle(G.x-1,G.y-2,5.8,SKIN);
+  ctx.restore();
+  L.bx=L.rx+GEO.headT.x*L.s+5*L.s;
+  L.by=L.ry+(GEO.headT.y-4)*L.s;
+}
+
+/* ---------- 特效 ---------- */
+function fx(){
+  const sf=Math.max(0,Math.min(1,(S.speed-CRUISE)/(SPRINT-CRUISE)));
+  if(sf>0.08){
+    ctx.strokeStyle="#ffffff";ctx.lineCap="round";
+    for(let k=0;k<4;k++){
+      const y=L.ry-40*L.s-k*26*L.s+Math.sin(S.t*13+k*3)*4;
+      const len=30+sf*70,x=L.rx-150*L.s-k*18;
+      ctx.globalAlpha=sf*0.4;ctx.lineWidth=3;
+      ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+len,y);ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+  }
+  for(const p of dust){
+    ctx.globalAlpha=Math.max(p.a,0);
+    circle(p.x,p.y,p.r,"rgba(186,176,158,1)");
+  }
+  ctx.globalAlpha=1;
+  for(const b of bubbles){
+    const u=Math.min(1,b.t/0.18);
+    const c1=1.70158,c3=c1+1;
+    const pop=1+c3*Math.pow(u-1,3)+c1*Math.pow(u-1,2);
+    const rise=b.t*34;
+    const y=b.y-56-rise,x=b.x;
+    const alpha=b.t<0.65?1:1-(b.t-0.65)/0.35;
+    ctx.globalAlpha=alpha;
+    ctx.fillStyle="rgba(255,255,255,.95)";
+    ctx.beginPath();
+    const bw=40*pop,bh=17*pop;
+    if(ctx.roundRect)ctx.roundRect(x-bw,y-bh,bw*2,bh*2,12*pop);
+    else ctx.rect(x-bw,y-bh,bw*2,bh*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x-6,y+bh);ctx.lineTo(x,y+bh+10);ctx.lineTo(x+6,y+bh);
+    ctx.closePath();ctx.fill();
+    ctx.fillStyle="#e2574c";
+    ctx.font="700 "+Math.round(15*pop)+"px system-ui,sans-serif";
+    ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText("叮铃～",x,y);
+    ctx.strokeStyle="#f6b93b";ctx.lineWidth=3;
+    for(let r=0;r<2;r++){
+      const rr=8+(b.t*44+r*16);
+      ctx.globalAlpha=alpha*0.5;
+      ctx.beginPath();ctx.arc(b.x,b.y,rr,-0.6,0.6);ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+  }
+}
+
+/* ---------- 主循环 ---------- */
+function draw(){
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.lineCap="round";ctx.lineJoin="round";
+  ctx.fillStyle=skyGrad;ctx.fillRect(0,0,W,H);
+  sun();clouds();birds();
+  ridge(H*0.50,64,"#cfe3f6",0.0016,0.0041,1.3,0.05);
+  ridge(H*0.545,46,"#ddecf9",0.0022,0.0058,4.0,0.09);
+  ridge(H*0.662,14,"#c9e8bd",0.013,0.031,2.6,0.22);
+  ctx.fillStyle="#b7e49e";ctx.fillRect(0,H*0.672,W,H-H*0.672);
+  midLayer();flowersMid();
+  road();
+  riderAll();
+  foreground();
+  fx();
+}
+let last=performance.now();
+function frame(now){
+  const dt=Math.min((now-last)/1000,0.05);last=now;
+  L=layout();
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+L=layout();
+requestAnimationFrame(frame);
+
+/* HUD */
+const hudSpeed=document.getElementById("hudSpeed"),hudDist=document.getElementById("hudDist");
+setInterval(()=>{
+  hudSpeed.textContent=Math.round(S.speed/28*3.6);
+  hudDist.textContent=(S.dist/28/1000).toFixed(2);
+},200);
+
+/* 测试钩子 */
+window.__stats={
+  get dist(){return S.dist},get speed(){return S.speed},
+  get crank(){return S.crank},get wheel(){return S.wheel},
+  get errors(){return errLog.length}
+};
+window.__setCrank=v=>{S.crank=v;};
+window.__bell=bell;
+</script>
+</body>
+</html>
